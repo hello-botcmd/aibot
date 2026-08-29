@@ -15,8 +15,8 @@ DASHBOARD_IMAGE_URL = "https://i.ibb.co/nhQQLxK/894e3a6da2af.jpg"
 CONTACT_USERNAME = "@sexyiwowu"
 
 # ── Telegram API credentials (from https://my.telegram.org) ──
-API_ID   = 36134104
-API_HASH = "7e85000983efb86b5d4739b6680016b2"
+TELEGRAM_API_ID   = 36134104
+TELEGRAM_API_HASH = "7e85000983efb86b5d4739b6680016b2"
 
 # ── OpenRouter AI ────────────────────────────────────────────
 OPENROUTER_API_KEY     = "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"
