@@ -1,0 +1,21 @@
+# Sensitive
+.env
+config.py
+
+# Data & sessions
+data/store.json
+data/bot.log
+*.session
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
