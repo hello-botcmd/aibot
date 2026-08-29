@@ -36,4 +36,4 @@ COOLDOWN_SECONDS  = 5    # min gap between AI replies per peer
 
 # ── Paid-photo trigger words ──────────────────────────────────
 # Add as many words as you want — any one of them will trigger the paid photo
-PAID_TRIGGER_WORDS = ["send", "photo", "pic", "content"]
+PAID_TRIGGER_WORD = "send"
