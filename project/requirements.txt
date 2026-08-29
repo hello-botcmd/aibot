@@ -1,0 +1,12 @@
+# Admin Dashboard Bot
+python-telegram-bot==21.6
+
+# Userbot (Telethon)
+telethon==1.36.0
+
+# AI / HTTP
+requests==2.32.3
+httpx==0.27.2          # optional, for future async HTTP
+
+# Utilities
+python-dotenv==1.0.1   # optional: load .env file
