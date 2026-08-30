@@ -1,17 +1,24 @@
 """
 bot/utils/ai.py
 ───────────────
-OpenRouter API wrapper (blocking ``requests`` calls run off-loop via
-``asyncio.to_thread`` so they never stall the event loop).
+OpenRouter API wrapper.  Blocking ``requests`` calls never touch the event
+loop: they run on a dedicated ``ThreadPoolExecutor`` (not the shared default
+one) over a **pooled keep-alive ``Session``**, so a reply does not pay for a
+fresh DNS lookup + TCP + TLS handshake every time — the reason the first
+replies after a restart used to be slow.
 
 Contract
 --------
-``generate_reply(persona, history, user_message)`` → ``(text, retry_after, ok)``
+``generate_reply(persona, history, user_message)`` → ``AIReply``
 
 * ``ok``          True only when the text is a real model answer.
 * ``retry_after`` seconds the caller should back off for (0/None when not a
                   rate-limit or billing problem).
 * ``text``        the reply when ``ok``, otherwise filler the caller may show.
+* ``reason``      machine-readable cause (``"ok"``, ``"timeout"``,
+                  ``"server_error"``, ``"billing"``, ``"no_api_key"``, …) so the
+                  caller can alert an admin with something actionable instead
+                  of "it failed".
 
 Error filler is *never* silently treated as a real answer — the caller uses
 ``ok`` to keep "I'm busy" strings out of the conversation history, which
@@ -22,9 +29,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
+from concurrent.futures import ThreadPoolExecutor
+from typing import NamedTuple
 
 import requests
+from requests.adapters import HTTPAdapter
 
 import config
 
@@ -39,6 +50,56 @@ _PARSE_ERROR    = "Couldn't understand the response, please try again. 🙏"
 _SLOW           = "Running a bit slow right now, please send again. 🙏"
 
 _CREDITS_TIMEOUT = 15
+_CONNECT_TIMEOUT = 5      # TCP+TLS must not eat into the read budget
+
+# ── Connection reuse ────────────────────────────────────────────────────────
+# ``requests.post(...)`` opens a brand new TCP connection and TLS handshake on
+# every call.  With no keep-alive every reply pays that cost, and it is at its
+# worst right after a restart when the DNS cache is cold — which is exactly the
+# "first replies after a restart are slow" symptom.  One pooled Session fixes it.
+_SESSION = requests.Session()
+_POOL = max(4, int(getattr(config, "OPENROUTER_POOL", 32) or 32))
+_ADAPTER = HTTPAdapter(pool_connections=max(2, _POOL // 4),
+                       pool_maxsize=_POOL, max_retries=0)
+_SESSION.mount("https://", _ADAPTER)
+_SESSION.mount("http://", _ADAPTER)
+
+# Dedicated pool for AI calls.  ``asyncio.to_thread`` borrows the loop's default
+# executor, which is also used by PTB and file IO — a burst of slow model calls
+# would otherwise stall unrelated work and add latency to every reply.
+_executor: ThreadPoolExecutor | None = None
+
+
+def _pool() -> ThreadPoolExecutor:
+    global _executor
+    if _executor is None:
+        workers = int(getattr(config, "AI_MAX_WORKERS", 8) or 8)
+        _executor = ThreadPoolExecutor(max_workers=max(2, workers),
+                                       thread_name_prefix="aibot-ai")
+    return _executor
+
+
+class AIReply(NamedTuple):
+    """Result of one OpenRouter call.  ``reason`` is always set, even on success."""
+    text: str
+    retry_after: int | None
+    ok: bool
+    reason: str = "ok"
+
+
+#: human wording for the machine-readable ``reason`` codes
+REASON_TEXT = {
+    "ok":              "success",
+    "no_api_key":      "OPENROUTER_API_KEY is not set",
+    "rate_limited":    "OpenRouter returned 429 (rate limited)",
+    "billing":         "OpenRouter rejected the key/credits (401/402/403)",
+    "server_error":    "OpenRouter 5xx after retrying",
+    "timeout":         "request timed out",
+    "http_error":      "OpenRouter HTTP error",
+    "network_error":   "network/DNS failure",
+    "parse_error":     "unexpected response body",
+    "empty_response":  "model returned no content",
+}
 
 
 # ── credit fetching ──────────────────────────────────────────────────────────
@@ -57,8 +118,9 @@ def _auth_headers(json_body: bool = True) -> dict:
 
 def _fetch_credits_sync() -> dict:
     """Returns {"used": float, "limit": float|None, "remaining": float|None}."""
-    resp = requests.get(config.OPENROUTER_CREDITS_URL,
-                        headers=_auth_headers(), timeout=_CREDITS_TIMEOUT)
+    resp = _SESSION.get(config.OPENROUTER_CREDITS_URL,
+                        headers=_auth_headers(),
+                        timeout=(_CONNECT_TIMEOUT, _CREDITS_TIMEOUT))
     resp.raise_for_status()
     data = resp.json().get("data", {}) or {}
     limit_dollars = data.get("limit")                # None = unlimited
@@ -84,8 +146,12 @@ async def fetch_credits() -> dict:
 
 # ── chat completion ──────────────────────────────────────────────────────────
 
-def _timeout() -> int:
-    return int(getattr(config, "OPENROUTER_TIMEOUT", 45) or 45)
+def _timeout() -> tuple[float, float]:
+    """(connect, read) — a hung connect must not consume the read budget."""
+    read = float(getattr(config, "OPENROUTER_TIMEOUT", 20) or 20)
+    connect = float(getattr(config, "OPENROUTER_CONNECT_TIMEOUT", _CONNECT_TIMEOUT)
+                    or _CONNECT_TIMEOUT)
+    return (connect, read)
 
 
 def _retry_after_seconds(resp) -> int:
@@ -114,15 +180,11 @@ def _build_messages(persona: str, history: list, user_message: str) -> list:
     return messages
 
 
-def _call_openrouter_sync(persona: str, history: list,
-                          user_message: str) -> tuple[str, int | None, bool]:
-    """
-    Synchronous OpenRouter call (run via ``asyncio.to_thread``).
-    Returns ``(reply_text, retry_after_seconds_or_None, ok)``.
-    """
+def _call_openrouter_sync(persona: str, history: list, user_message: str) -> AIReply:
+    """Synchronous OpenRouter call — run on the dedicated AI executor."""
     if not getattr(config, "OPENROUTER_API_KEY", ""):
         logger.error("OPENROUTER_API_KEY is not set — AI replies are disabled")
-        return _NOT_CONFIGURED, None, False
+        return AIReply(_NOT_CONFIGURED, None, False, "no_api_key")
 
     payload = {
         "model":       config.OPENROUTER_MODEL,
@@ -136,7 +198,7 @@ def _call_openrouter_sync(persona: str, history: list,
 
     for attempt in range(1, max_attempts + 1):
         try:
-            resp = requests.post(
+            resp = _SESSION.post(
                 config.OPENROUTER_URL,
                 json=payload,
                 headers=_auth_headers(),
@@ -150,13 +212,13 @@ def _call_openrouter_sync(persona: str, history: list,
                 backoff = int(getattr(config, "CRITICAL_BACKOFF_SECONDS", 3600) or 3600)
                 logger.error("OpenRouter %s — backing off %ss (check key/credits). body: %s",
                              status, backoff, (resp.text or "")[:300])
-                return _BUSY, backoff, False
+                return AIReply(_BUSY, backoff, False, "billing")
 
             # ── rate limit: retry later, but not forever ──────────────────
             if status == 429:
                 retry_after = _retry_after_seconds(resp)
                 logger.warning("OpenRouter 429 — retry after %ds", retry_after)
-                return _RATE_LIMITED, retry_after, False
+                return AIReply(_RATE_LIMITED, retry_after, False, "rate_limited")
 
             # ── server-side: worth one more attempt ───────────────────────
             if status >= 500:
@@ -165,15 +227,15 @@ def _call_openrouter_sync(persona: str, history: list,
                                status, attempt, max_attempts)
                 if attempt < max_attempts:
                     continue
-                return _BUSY, None, False
+                return AIReply(_BUSY, None, False, "server_error")
 
             resp.raise_for_status()
             data = resp.json()
             content = (data.get("choices") or [{}])[0].get("message", {}).get("content")
             if not content:
                 logger.error("OpenRouter returned no content: %s", str(data)[:300])
-                return _PARSE_ERROR, None, False
-            return content.strip(), None, True
+                return AIReply(_PARSE_ERROR, None, False, "empty_response")
+            return AIReply(content.strip(), None, True, "ok")
 
         except requests.exceptions.Timeout as exc:
             last_error = exc
@@ -181,28 +243,60 @@ def _call_openrouter_sync(persona: str, history: list,
                            attempt, max_attempts, exc)
             if attempt < max_attempts:
                 continue
-            return _SLOW, None, False
+            return AIReply(_SLOW, None, False, "timeout")
 
         except requests.exceptions.HTTPError as exc:
             body = ""
             with contextlib.suppress(Exception):
                 body = (exc.response.text or "")[:300]
             logger.error("OpenRouter HTTP error: %s | body: %s", exc, body)
-            return _BUSY, None, False
+            return AIReply(_BUSY, None, False, "http_error")
 
         except requests.exceptions.RequestException as exc:
             logger.error("OpenRouter request error: %s", exc)
-            return _BUSY, None, False
+            return AIReply(_BUSY, None, False, "network_error")
 
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             logger.error("OpenRouter parse error: %s", exc)
-            return _PARSE_ERROR, None, False
+            return AIReply(_PARSE_ERROR, None, False, "parse_error")
 
     logger.error("OpenRouter failed after %d attempt(s): %s", max_attempts, last_error)
-    return _SLOW, None, False
+    return AIReply(_SLOW, None, False, "server_error")
 
 
-async def generate_reply(persona: str, history: list,
-                         user_message: str) -> tuple[str, int | None, bool]:
+async def generate_reply(persona: str, history: list, user_message: str) -> AIReply:
     """Async wrapper — safe to call from Telethon / PTB event handlers."""
-    return await asyncio.to_thread(_call_openrouter_sync, persona, history, user_message)
+    loop = asyncio.get_running_loop()
+    call = functools.partial(_call_openrouter_sync, persona, history, user_message)
+    try:
+        return await loop.run_in_executor(_pool(), call)
+    except Exception as exc:                         # noqa: BLE001
+        # Should not happen, but a failure here must still surface a reason
+        # rather than taking the whole DM handler down.
+        logger.exception("OpenRouter call crashed: %s", exc)
+        return AIReply(_BUSY, None, False, "network_error")
+
+
+async def warmup() -> None:
+    """
+    Prime the HTTPS connection (DNS + TCP + TLS) and validate the key.
+
+    Call once at startup.  Without it the first real reply after a restart
+    absorbs the full cold-start cost, which is the "late response after a
+    restart" symptom.
+    """
+    if not getattr(config, "OPENROUTER_WARMUP", True):
+        return
+    if not getattr(config, "OPENROUTER_API_KEY", ""):
+        return
+
+    def _prime() -> None:
+        try:
+            resp = _SESSION.get(config.OPENROUTER_CREDITS_URL,
+                                headers=_auth_headers(),
+                                timeout=(_CONNECT_TIMEOUT, _CREDITS_TIMEOUT))
+            logger.info("OpenRouter connection warmed up (HTTP %s)", resp.status_code)
+        except Exception as exc:                     # noqa: BLE001
+            logger.debug("OpenRouter warm-up failed (will retry on first use): %s", exc)
+
+    await asyncio.to_thread(_prime)
