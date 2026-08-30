@@ -63,8 +63,11 @@ async def post_init(application: Application) -> None:
     logger.info("Reconnecting saved userbot sessions…")
     await start_all_saved_userbots()
     logger.info("All saved userbots reconnected. Dashboard bot starting…")
-
-
+    for sid, remaining in db.sweep_expired_backoffs():
+    logger.warning("⚠️  Account %s is still muted for %ds …", sid[:8], remaining)
+    await start_all_saved_userbots() 
+    await warmup()
+  
 async def post_shutdown(application: Application) -> None:
     await disconnect_all()
     try:
