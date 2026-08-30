@@ -4,6 +4,9 @@ bot/utils/keyboards.py
 All InlineKeyboardMarkup builders in one place.
 Premium-style layout: wide single-column buttons for primary actions,
 2×2 grid for the dashboard feature menu.
+
+Callback data is kept short because Telegram caps it at 64 bytes — session ids
+are 12 chars, so ``paidacc_<sid>`` and friends fit comfortably.
 """
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -63,9 +66,10 @@ def accounts_keyboard(accounts: dict) -> InlineKeyboardMarkup:
 
 def account_actions_keyboard(session_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [_btn("💎  Paid Photo", f"paidacc_{session_id}")],
         [
-            _btn("🗑  Terminate",    f"terminate_{session_id}"),
-            _btn("🔙  Back",         "manage_accounts"),
+            _btn("🗑  Terminate", f"terminate_{session_id}"),
+            _btn("🔙  Back",      "manage_accounts"),
         ],
     ])
 
@@ -81,15 +85,26 @@ def toggle_keyboard(current_state: bool) -> InlineKeyboardMarkup:
     ])
 
 
-# ── Paid photo confirm ───────────────────────────────────────────────────────
+# ── Paid photo ───────────────────────────────────────────────────────────────
 
 def paid_photo_account_keyboard(accounts: dict) -> InlineKeyboardMarkup:
     """Pick which account to set the paid photo for."""
     rows = []
     for sid, acc in accounts.items():
         label = acc.get("name") or acc.get("phone") or sid[:12]
-        rows.append([_btn(f"📱  {label}", f"paidacc_{sid}")])
+        has = " ✅" if (acc.get("paid") or {}).get("photo_file") else ""
+        rows.append([_btn(f"📱  {label}{has}", f"paidacc_{sid}")])
     rows.append([_btn("🔙  Cancel", "dashboard")])
+    return InlineKeyboardMarkup(rows)
+
+
+def paid_menu_keyboard(session_id: str, has_photo: bool) -> InlineKeyboardMarkup:
+    """Per-account paid-photo submenu."""
+    rows = [[_btn("📸  Upload Photo", f"paidphoto_{session_id}")]]
+    if has_photo:
+        rows.append([_btn("⭐  Set Star Price", f"paidstars_{session_id}")])
+        rows.append([_btn("🗑  Remove Paid Photo", f"paidremove_{session_id}")])
+    rows.append([_btn("🔙  Back", f"acc_{session_id}")])
     return InlineKeyboardMarkup(rows)
 
 
