@@ -650,7 +650,29 @@ def increment_api_calls() -> int:
     """Back-compat shim for the old ``total_api_calls`` counter."""
     return bump_counter("calls_ok")
 
-
+def sweep_expired_backoffs() -> list[tuple[str, int]]:
+    """
+    Clear ``rate_limited_until`` values that are in the past, and report the
+    ones still active.  The timestamp is persisted, so without this a 60s 429
+    (or a 1h billing backoff) from *before* a restart would silently keep
+    muting the account afterwards.
+    """
+    data = load(); now = time.time()
+    still_muted, changed = [], False
+    for sid, acc in data["accounts"].items():
+        if not isinstance(acc, dict):
+            continue
+        until = float(acc.get("rate_limited_until") or 0)
+        if until <= 0:
+            continue
+        if until <= now:
+            acc["rate_limited_until"] = 0.0; changed = True
+        else:
+            still_muted.append((sid, int(until - now)))
+    if changed:
+        save_soon()
+    return still_muted
+  
 def get_uptime_seconds() -> int:
     """Seconds since this process started (uptime_start is reset every boot)."""
     start = load().get("uptime_start") or int(time.time())
