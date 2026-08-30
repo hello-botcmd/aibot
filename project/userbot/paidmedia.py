@@ -5,7 +5,7 @@ Delivers the paid photo **as the userbot**, priced in Telegram Stars.
 
 Why this module exists
 ──────────────────────
-The old flow was broken twice over:
+The original flow was broken twice over:
 
 1. the photo's ``file_id`` was minted by the *dashboard bot* — a completely
    different Telegram identity — so the userbot could not resolve it and every
@@ -13,8 +13,8 @@ The old flow was broken twice over:
 2. ``paid_stars`` was read from the DB and then ignored, so the media went out
    for free even when the admin configured a price.
 
-New flow
-────────
+Flow
+────
 * the dashboard bot **downloads the bytes** it received and writes them to
   ``data/paid/<sid>-paid.jpg`` → the file on disk is the source of truth;
 * the userbot uploads those bytes to **its own** account once and caches the
@@ -30,9 +30,11 @@ Requires Telethon ≥ 1.41 for ``InputMediaPaidMedia`` (pinned in requirements).
 from __future__ import annotations
 
 import base64
+import contextlib
 import io
 import logging
 import time
+from pathlib import Path
 
 from telethon import errors, utils
 from telethon.tl import functions, types
@@ -41,7 +43,9 @@ import config
 
 logger = logging.getLogger(__name__)
 
-_REF_KEYS = ("id", "hash", "ref")
+# ``file_reference`` may legitimately be empty on a freshly uploaded photo, so
+# only id + access_hash are required for a handle to be considered usable.
+_REF_KEYS = ("id", "hash")
 _EXPIRY_MARKERS = ("FILE_REFERENCE", "ACCESS_HASH_INVALID", "STORAGE_FILE_INVALID",
                    "IMAGE_FILE_INVALID", "WEBPAGE_CURL_FAILED")
 
@@ -62,12 +66,20 @@ def supports_stars() -> bool:
     return hasattr(types, "InputMediaPaidMedia")
 
 
-def file_for(rel_path: str | None):
+def file_for(rel_path: str | None) -> Path | None:
     """Absolute path for a stored media file, or None if it is missing."""
     if not rel_path:
         return None
-    path = config.DATA_DIR / rel_path
-    return path if path.exists() else None
+    path = config.DATA_DIR / str(rel_path)
+    return path if path.is_file() else None
+
+
+def rel_for(abs_path: Path | str) -> str:
+    """Inverse of :func:`file_for` — store paths relative to DATA_DIR."""
+    try:
+        return Path(abs_path).resolve().relative_to(config.DATA_DIR.resolve()).as_posix()
+    except (ValueError, OSError):
+        return str(abs_path)
 
 
 def ref_ok(ref) -> bool:
@@ -75,17 +87,19 @@ def ref_ok(ref) -> bool:
 
 
 def _to_input_photo(ref: dict) -> types.InputPhoto:
+    if not ref_ok(ref):
+        raise NeedReupload("photo_ref is missing id/hash")
     try:
         return types.InputPhoto(
             id=int(ref["id"]),
             access_hash=int(ref["hash"]),
-            file_reference=base64.b64decode(ref["ref"]),
+            file_reference=base64.b64decode(ref.get("ref") or b""),
         )
     except (TypeError, ValueError) as exc:            # corrupt cache entry
         raise NeedReupload(f"unusable photo_ref: {exc}") from exc
 
 
-async def persist(client, rel_path: str) -> dict:
+async def persist(client, rel_path: str | None) -> dict:
     """
     Upload the on-disk image to *this* account and return a storable handle.
 
@@ -130,13 +144,15 @@ async def persist(client, rel_path: str) -> dict:
 def _message_id(update) -> int | None:
     mid = getattr(update, "id", None)
     if mid:
-        return int(mid)
+        with contextlib.suppress(TypeError, ValueError):
+            return int(mid)
     for holder in ("messages", "updates"):
         for item in reversed(getattr(update, holder, None) or []):
             candidate = getattr(item, "id", None) or getattr(
                 getattr(item, "message", None), "id", None)
             if candidate:
-                return int(candidate)
+                with contextlib.suppress(TypeError, ValueError):
+                    return int(candidate)
     return None
 
 
@@ -147,10 +163,11 @@ async def send(client, peer, *, photo_ref: dict, stars: int = 0, caption: str = 
     Send the cached photo to ``peer``, optionally locked behind ``stars`` Stars.
 
     Returns the sent message id when Telegram tells us one.
+    Raises :class:`NeedReupload` when the cached handle has expired.
     """
     stars = int(stars or 0)
     media = types.InputMediaPhoto(id=_to_input_photo(photo_ref))
-    nofwd = config.PAID_NO_FORWARDS if noforwards is None else bool(noforwards)
+    nofwd = bool(config.PAID_NO_FORWARDS if noforwards is None else noforwards)
 
     if stars > 0:
         if not supports_stars():
@@ -196,7 +213,8 @@ async def send_from_disk(client, peer, rel_path: str, *, caption: str = "",
     if path is None:
         raise MediaUnavailable(f"missing file: {rel_path}")
     msg = await client.send_file(peer, str(path), caption=caption or "",
-                                 force_document=False, silent=False)
+                                 force_document=False, silent=False,
+                                 noforwards=bool(noforwards))
     return _message_id(msg) if msg is not None else None
 
 
