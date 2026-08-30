@@ -10,6 +10,7 @@ Run:  python main.py   (from the project/ directory)
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 
@@ -23,6 +24,7 @@ from telegram.ext import (
 )
 
 import config
+from bot.utils.ai import warmup
 from bot.handlers.dashboard import callback_handler, error_handler, message_handler
 from bot.handlers.start     import start_handler
 from bot.utils              import db
@@ -60,14 +62,31 @@ def setup_logging() -> None:
 # ── Startup / Shutdown hooks ──────────────────────────────────────────────────
 
 async def post_init(application: Application) -> None:
-    logger.info("Reconnecting saved userbot sessions…")
-    await start_all_saved_userbots()
-    logger.info("All saved userbots reconnected. Dashboard bot starting…")
+    """
+    Runs once, before the dashboard bot starts polling.
+
+    Order matters:
+
+    1. Clear any rate-limit/backoff left over from a previous run.  It is
+       persisted, so without this an account muted before the restart stays
+       silent afterwards — indistinguishable from "the bot doesn't reply".
+       Anything *still* muted is named out loud instead of failing quietly.
+    2. Reconnect the sessions and warm the OpenRouter connection **at the same
+       time**.  Sequentially, the warm-up would either delay startup or — if
+       it ran after — risk the first DM arriving before it finished, which is
+       the "late response after a restart" symptom.
+    """
     for sid, remaining in db.sweep_expired_backoffs():
-    logger.warning("⚠️  Account %s is still muted for %ds …", sid[:8], remaining)
-    await start_all_saved_userbots() 
-    await warmup()
-  
+        logger.warning("⚠️  Account %s is still muted for %ds (rate limit / "
+                       "billing backoff) — it will not auto-reply until then.",
+                       sid[:8], remaining)
+
+    logger.info("Reconnecting saved userbot sessions and warming the AI link…")
+    await asyncio.gather(start_all_saved_userbots(), warmup())
+
+    logger.info("All saved userbots reconnected. Dashboard bot starting…")
+
+
 async def post_shutdown(application: Application) -> None:
     await disconnect_all()
     try:
