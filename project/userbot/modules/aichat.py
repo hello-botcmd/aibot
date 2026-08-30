@@ -6,18 +6,19 @@ Per-account DM pipeline for every Telethon client:
     trigger word?  → deliver the PAID photo   (independent of the AI switch)
     else           → AI auto-reply             (global switch AND account switch)
 
-Fixes baked in
-──────────────
-* 💎 paid-photo check now runs **before** the AI gate — previously a "Turn AI
-  off" for the evening silently killed the paywall delivery too.
-* 💎 Stars are actually charged now (see :mod:`userbot.paidmedia`), and the
-  media reference belongs to the userbot, not to the dashboard bot.
+Design notes
+────────────
+* 💎 paid-photo check runs **before** the AI gate — turning AI off for the
+  evening no longer silently kills paywall delivery.
+* 💎 Stars are actually charged (see :mod:`userbot.paidmedia`), and the media
+  reference belongs to the userbot, not to the dashboard bot.
 * trigger matching is whole-word, so "sender"/"sending" no longer buy anything
   (and no longer swallow the AI reply).
 * ``.aichatoff`` really disables AI for one account: the gate is
   ``global_ai_on AND account.ai_enabled``, and the dashboard's
-  "Turn ON/OFF All" is an explicit bulk set instead of a mirror.
-* AI error filler is never written into the conversation history.
+  "Turn ON/OFF All" is an explicit bulk set (see ``db.set_global_ai``).
+* AI error filler is never written into the conversation history — the third
+  element of ``generate_reply()`` says whether the text is a real answer.
 * peer history/cooldowns are TTL- and size-capped; the per-peer lock table is
   bounded instead of growing forever.
 * restart replay guard: messages older than REPLY_MAX_AGE_SECONDS are ignored.
@@ -30,7 +31,6 @@ import contextlib
 import logging
 import time
 from collections import OrderedDict
-from datetime import timezone
 
 from telethon import TelegramClient, errors, events
 
@@ -68,6 +68,12 @@ def _get_lock(session_id: str, peer_id: str) -> asyncio.Lock:
     return lock
 
 
+def forget_session(session_id: str) -> None:
+    """Drop all in-memory state for a terminated account."""
+    _locks.pop(session_id, None)
+    _admin_notify_at.pop(session_id, None)
+
+
 def _trigger_matches(text: str) -> str | None:
     """Return the matched trigger word/phrase (or None)."""
     return match_trigger(text, getattr(config, "PAID_TRIGGER_WORDS", []),
@@ -103,7 +109,7 @@ async def _notify_admins(client: TelegramClient, sid: str, text: str, *,
     if now - _admin_notify_at.get(sid, 0) < throttle:
         return
     _admin_notify_at[sid] = now
-    for admin_id in config.ADMIN_IDS:
+    for admin_id in getattr(config, "ADMIN_IDS", []):
         try:
             await client.send_message(admin_id, f"[aibot · {sid[:8]}] {text}")
         except Exception as exc:                            # noqa: BLE001
@@ -126,8 +132,7 @@ async def _deliver_paid(client: TelegramClient, sid: str, acc: dict, chat_id: in
     caption = paid.get("caption") or (
         config.PAID_LOCKED_CAPTION.format(stars=stars) if stars else config.PAID_FREE_CAPTION
     )
-    ref = paid.get("photo_ref") or {}
-    teaser = paid.get("teaser_ref") or {}
+    teaser: dict = {}
     payload = f"aibot:{sid}:{trigger}"[:128]
 
     async def _ensure(ref_val, file_key, ref_key):
@@ -138,9 +143,10 @@ async def _deliver_paid(client: TelegramClient, sid: str, acc: dict, chat_id: in
         return new
 
     try:
-        ref = await _ensure(ref, "photo_file", "photo_ref")
+        ref = await _ensure(paid.get("photo_ref"), "photo_file", "photo_ref")
         if stars > 0 and paid.get("teaser_file"):
-            teaser = await _ensure(teaser, "teaser_file", "teaser_ref")
+            teaser = await _ensure(paid.get("teaser_ref"), "teaser_file", "teaser_ref")
+
         try:
             await paidmedia.send(client, chat_id, photo_ref=ref, stars=stars,
                                  caption=caption, teaser_ref=teaser, payload=payload)
@@ -150,6 +156,7 @@ async def _deliver_paid(client: TelegramClient, sid: str, acc: dict, chat_id: in
             db.update_paid(sid, photo_ref=ref)
             await paidmedia.send(client, chat_id, photo_ref=ref, stars=stars,
                                  caption=caption, teaser_ref=teaser, payload=payload)
+
     except (paidmedia.PaidUnsupported, paidmedia.MediaUnavailable) as exc:
         logger.error("[%s] paid send unavailable (%s): %s", sid[:8], type(exc).__name__, exc)
         await _notify_admins(
@@ -161,14 +168,17 @@ async def _deliver_paid(client: TelegramClient, sid: str, acc: dict, chat_id: in
             with contextlib.suppress(Exception):
                 await paidmedia.send_from_disk(client, chat_id, rel, caption="")
                 db.bump_counter("paid_sends")
+                db.record_peer(sid, peer_id, count_send=True)
                 return True
         with contextlib.suppress(Exception):
             await client.send_message(chat_id, config.PAID_BUSY_TEXT)
         return False
+
     except errors.FloodWaitError as exc:
         logger.warning("[%s] flood wait %ss while sending paid photo", sid[:8], exc.seconds)
-        db.update_account(sid, rate_limited_until=time.time() + exc.seconds)
+        db.set_rate_limited(sid, time.time() + int(exc.seconds or 0))
         return False
+
     except Exception as exc:                                # noqa: BLE001
         logger.exception("[%s] paid send failed: %s", sid[:8], exc)
         await _notify_admins(client, sid, f"⚠️ Paid send error: {exc}")
@@ -190,12 +200,14 @@ def register(client: TelegramClient, session_id: str) -> None:
     @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
     async def on_private_message(event):
         sender = await event.get_sender()
-        if sender is None or getattr(sender, "bot", False) and config.IGNORE_BOTS:
+        if sender is None:
+            return
+        if getattr(sender, "bot", False) and getattr(config, "IGNORE_BOTS", True):
             return
 
         try:
             own = await client.get_me()
-            if own and getattr(sender, "id", None) == own.id:
+            if own is not None and getattr(sender, "id", None) == own.id:
                 return                                    # own DMs / Saved Messages
         except Exception:                                 # noqa: BLE001
             pass
@@ -203,17 +215,21 @@ def register(client: TelegramClient, session_id: str) -> None:
         # ── ignore ancient messages replayed after a restart ─────────────
         max_age = getattr(config, "REPLY_MAX_AGE_SECONDS", 0)
         msg_date = getattr(event.message, "date", None)
-        if max_age and msg_date:
-            age = time.time() - msg_date.replace(tzinfo=timezone.utc).timestamp()
-            if age > max_age:
-                logger.debug("[%s] ignoring %ss-old message", session_id[:8], int(age))
-                return
+        if max_age and msg_date is not None:
+            stamp = getattr(msg_date, "timestamp", None)
+            if callable(stamp):                       # datetime.timestamp()
+                stamp = stamp()
+            if isinstance(stamp, (int, float)):       # unparsable → don't drop it
+                age = time.time() - float(stamp)
+                if age > max_age:
+                    logger.debug("[%s] ignoring %ss-old message", session_id[:8], int(age))
+                    return
 
         text = (event.message.text or "").strip()
         if not text:
             return
-        if len(text) > config.MAX_INPUT_CHARS:
-            text = text[: config.MAX_INPUT_CHARS]
+        if len(text) > getattr(config, "MAX_INPUT_CHARS", 1000):
+            text = text[: getattr(config, "MAX_INPUT_CHARS", 1000)]
 
         acc = db.get_account(session_id, config.DEFAULT_PERSONA)
         if acc is None:
@@ -233,20 +249,18 @@ def register(client: TelegramClient, session_id: str) -> None:
                             session_id[:8], trigger, peer_id)
 
             # ── 2. 🤖 AI auto-reply ───────────────────────────────────────
-            store = db.load()
-            if not store.get("global_ai_on"):          # master kill-switch
+            if not db.is_global_ai_on():                # master kill-switch
                 return
-            if not acc.get("ai_enabled"):              # per-account preference
+            if not acc.get("ai_enabled"):               # per-account preference
                 return
 
             now = time.time()
-            if now - db.peer_last_ts(session_id, peer_id) < config.COOLDOWN_SECONDS:
+            if now - db.peer_last_ts(session_id, peer_id) < getattr(config, "COOLDOWN_SECONDS", 0):
                 return
             if now < float(acc.get("rate_limited_until") or 0):
                 return
 
-            db.record_peer(session_id, peer_id)       # stamp activity immediately
-            db.save_soon()
+            db.record_peer(session_id, peer_id)        # stamp activity immediately
 
             stop_typing = asyncio.Event()
             typing_task = asyncio.create_task(_keep_typing(client, event.chat_id, stop_typing))
@@ -261,17 +275,18 @@ def register(client: TelegramClient, session_id: str) -> None:
                     await typing_task
 
             if retry_after:                            # 429 / 402 / auth
-                until = time.time() + retry_after
-                db.update_account(session_id, rate_limited_until=until)
+                db.set_rate_limited(session_id, time.time() + float(retry_after))
                 logger.info("[%s] backing off until %s", session_id[:8],
-                            time.strftime("%H:%M", time.localtime(until)))
+                            time.strftime("%H:%M", time.localtime(time.time() + retry_after)))
+
             if not ok:
                 db.bump_counter("calls_failed")
                 if retry_after and retry_after >= getattr(config, "CRITICAL_BACKOFF_SECONDS", 3600):
-                    await _notify_admins(client, session_id,
-                                         f"⚠️ AI disabled for {retry_after}s — OpenRouter error "
-                                         f"(check key/credits). Model: {config.OPENROUTER_MODEL}",
-                                         throttle=3600)
+                    await _notify_admins(
+                        client, session_id,
+                        f"⚠️ AI disabled for {retry_after}s — OpenRouter error "
+                        f"(check key/credits). Model: {config.OPENROUTER_MODEL}",
+                        throttle=3600)
                 return                                 # silent: never expose quota to peers
 
             try:
@@ -283,6 +298,7 @@ def register(client: TelegramClient, session_id: str) -> None:
 
             db.bump_counter("calls_ok")
             # only REAL answers enter the history (no "busy right now" filler)
-            db.record_peer(session_id, peer_id, user_text=text, assistant_text=reply_text)
+            db.record_peer(session_id, peer_id,
+                           user_text=text, assistant_text=reply_text)
 
     logger.debug("[%s] AI chat handler registered.", session_id[:8])
