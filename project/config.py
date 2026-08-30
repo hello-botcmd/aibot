@@ -191,3 +191,18 @@ def validate(strict: bool = True) -> tuple[list[str], list[str]]:
         raise SystemExit("\n✖ Cannot start:\n  - " + "\n  - ".join(fatal) +
                          "\n\nCopy project/.env.example → project/.env, fill it in, then re-run.\n")
     return fatal, warn
+# Worst case per message is (connect + read) × 2 attempts, and a reply is held
+# hostage to it — so keep the read timeout tight.  45s meant a single hung call
+# could stall that conversation for 90s.
+OPENROUTER_TIMEOUT = 20          # seconds to wait for the model to answer
+OPENROUTER_CONNECT_TIMEOUT = 5   # TCP + TLS only; a hung connect must not eat the read budget
+OPENROUTER_WARMUP = True         # prime DNS/TLS at startup so the first reply isn't slow
+OPENROUTER_POOL = 32             # keep-alive connection pool size
+AI_MAX_WORKERS = 8               # threads for AI calls (isolated from the event loop's pool)
+
+COOLDOWN_SECONDS = 5             # min gap between *generations* per peer.
+                                 # Note: this no longer DROPS messages — a
+                                 # message arriving inside the window is
+                                 # coalesced into the next reply instead.
+
+AI_MAX_COALESCE = 3              # after this many supersedes in a row, reply anyway
